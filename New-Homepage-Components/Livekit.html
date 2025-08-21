@@ -1,0 +1,293 @@
+<script>
+(function () {
+  /** ================== CONFIG ================== **/
+  var SERVER_URL = "https://voicex-platform-layer-in.nurixlabs.tech";
+  var USER_ID    = "40d323bc-dc17-4b3d-a7ac-8ded8a0b16ff";
+
+  /** ================== LIGHT FETCH WRAPPER ================== **/
+  function jfetch(url, opts) {
+    return fetch(url, opts).then(async function (res) {
+      var ct = res.headers.get('content-type') || '';
+      var body = ct.includes('application/json') ? await res.json() : await res.text();
+      if (!res.ok) {
+        var err = new Error('HTTP ' + res.status);
+        err.status = res.status;
+        err.body = body;
+        throw err;
+      }
+      return body;
+    });
+  }
+
+  /** ================== LOAD LIVEKIT (UMD) ================== **/
+  function ensureLiveKit() {
+    if (window.LivekitClient) return Promise.resolve(window.LivekitClient);
+    return new Promise(function (resolve, reject) {
+      var s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js';
+      s.async = true;
+      s.onload = function () {
+        if (window.LivekitClient) resolve(window.LivekitClient);
+        else reject(new Error('LiveKit UMD failed to load'));
+      };
+      s.onerror = function () { reject(new Error('Failed to load LiveKit UMD')); };
+      document.head.appendChild(s);
+    });
+  }
+
+  /** ================== INTERNAL STATE ================== **/
+  var isCallActive  = false;
+  var isCallLoading = false;
+  var queuedCallId  = null;
+  var room          = null;        // LiveKit.Room
+  var audioEls      = new Set();
+  var pollHandle    = null;
+
+  var listeners = { statechange:new Set(), error:new Set(), connected:new Set(), ended:new Set() };
+  function emit(evt, payload) {
+    (listeners[evt] || new Set()).forEach(function (fn) { try { fn(payload); } catch(_) {} });
+    try { window.dispatchEvent(new CustomEvent('voicex:' + evt, { detail: payload })); } catch(_) {}
+  }
+  function getState() { return { isCallActive:isCallActive, isCallLoading:isCallLoading, queuedCallId:queuedCallId }; }
+  function onStateChange() { emit('statechange', getState()); }
+
+  var base = SERVER_URL.replace(/\/+$/,'');
+
+  /** ================== API CALLS ================== **/
+  function registerCall(agentId, ttsConfigId, dynamicVars) {
+    var body = {
+      agent_id: agentId,
+      overide_previous_context: true, // keep key as in your working code
+      custom_dynamic_variables_config: dynamicVars || {}
+    };
+    if (ttsConfigId) body.tts_config_id = ttsConfigId;
+
+    return jfetch(base + '/web/call', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'user-id': USER_ID },
+      body: JSON.stringify(body)
+    });
+  }
+
+  function getStatus(callId) {
+    return jfetch(base + '/web/call/' + encodeURIComponent(callId) + '/status', {
+      method: 'GET',
+      headers: { 'user-id': USER_ID }
+    });
+  }
+
+  /** ================== LIVEKIT CONNECT/DISCONNECT ================== **/
+  function attachRemoteAudio(track) {
+    var el = track.attach();
+    el.autoplay = true;
+    el.playsInline = true;
+    document.body.appendChild(el);
+    audioEls.add(el);
+  }
+  function detachAllAudio() {
+    audioEls.forEach(function (el) { try { el.pause(); el.srcObject = null; el.remove(); } catch(_) {} });
+    audioEls.clear();
+  }
+
+  function enableMicrophoneWithRetries(lk) {
+    if (!room || !room.localParticipant) return Promise.resolve();
+    function tryEnable() {
+      return room.localParticipant.setMicrophoneEnabled(true)
+        .then(function () { return true; })
+        .catch(function (e) { console.warn('[AutoMic] enable failed:', e); return false; });
+    }
+    return tryEnable().then(function (ok) {
+      if (ok) return;
+      return new Promise(function (res) {
+        setTimeout(function () {
+          if (!room || !room.localParticipant) return res();
+          tryEnable().then(function () {
+            setTimeout(function () {
+              if (!room || !room.localParticipant) return res();
+              tryEnable().then(res);
+            }, 3000);
+          });
+        }, 1000);
+      });
+    });
+  }
+
+  function livekitConnect(serverUrl, participantToken) {
+    return ensureLiveKit().then(async function (lk) {
+      await livekitDisconnect(); // clean prior
+
+      room = new lk.Room({});
+      room.on(lk.RoomEvent.TrackSubscribed, function (track) { if (track.kind === 'audio') attachRemoteAudio(track); });
+      room.on(lk.RoomEvent.Disconnected, function () { hardEnd(); });
+
+      await room.connect(serverUrl, participantToken);
+      await enableMicrophoneWithRetries(lk);
+
+      isCallActive = true;
+      isCallLoading = false;
+      queuedCallId = null;
+      onStateChange();
+      emit('connected', null);
+    });
+  }
+
+  function livekitDisconnect() {
+    var p = Promise.resolve();
+    if (room) {
+      try { p = room.disconnect(); } catch(_) {}
+    }
+    room = null;
+    detachAllAudio();
+    return p;
+  }
+
+  /** ================== QUEUE POLLING ================== **/
+  function beginPolling(callId) {
+    stopPolling();
+    var T0 = Date.now();
+    var MAX_WAIT_MS = 90 * 1000;
+    pollHandle = setInterval(function () {
+      getStatus(callId).then(function (res) {
+        var ready = res && typeof res.serverUrl === 'string' && res.serverUrl.trim() &&
+                          typeof res.participantToken === 'string' && res.participantToken.trim();
+        if (ready) {
+          stopPolling();
+          return livekitConnect(res.serverUrl, res.participantToken);
+        }
+      }).catch(function (e) {
+        if (e && (e.status === 404 || e.status === 410)) {
+          isCallLoading = false;
+          queuedCallId = null;
+          onStateChange();
+          stopPolling();
+          return;
+        }
+        emit('error', e);
+      }).finally(function () {
+        if (pollHandle && Date.now() - T0 > MAX_WAIT_MS) {
+          isCallLoading = false;
+          queuedCallId = null;
+          onStateChange();
+          stopPolling();
+        }
+      });
+    }, 1200);
+  }
+  function stopPolling() { if (pollHandle) clearInterval(pollHandle); pollHandle = null; }
+
+  /** ================== PUBLIC ACTIONS ================== **/
+  function startAgentCall(agentId, opts) {
+    opts = opts || {};
+    if (isCallActive || isCallLoading) return Promise.resolve();
+    isCallLoading = true;
+    onStateChange();
+
+    return registerCall(agentId, opts.ttsConfigId, opts.dynamicVars).then(function (details) {
+      if (details && details.serverUrl && details.participantToken) {
+        return livekitConnect(details.serverUrl, details.participantToken);
+      }
+      if (details && details.call_id) {
+        queuedCallId = details.call_id;
+        onStateChange();
+        beginPolling(details.call_id);
+        return;
+      }
+      throw new Error('No serverUrl/participantToken and no call_id returned.');
+    }).catch(function (e) {
+      isCallLoading = false;
+      onStateChange();
+      emit('error', e);
+    });
+  }
+
+  function endAgentCall() {
+    isCallLoading = true;
+    onStateChange();
+    return livekitDisconnect().finally(function () { hardEnd(); });
+  }
+
+  function hardEnd() {
+    stopPolling();
+    isCallActive = false;
+    isCallLoading = false;
+    queuedCallId = null;
+    onStateChange();
+    emit('ended', null);
+  }
+
+  /** ================== EXPOSE WIDGET API (NO GLOBAL LEAKS) ================== **/
+  window.LiveKitWidget = {
+    startAgentCall: startAgentCall,
+    endAgentCall:   endAgentCall,
+    hardEnd:        hardEnd,
+    on: function (evt, fn) {
+      if (!listeners[evt]) listeners[evt] = new Set();
+      listeners[evt].add(fn);
+      return function () { listeners[evt].delete(fn); };
+    },
+    getState: getState
+  };
+
+  window.addEventListener('beforeunload', hardEnd);
+})();
+</script>
+
+<!-- ================== STYLES ================== -->
+<!-- ================== HTML ================== -->
+<div class="industry-widget">
+  <!-- Industry list -->
+  <div class="industry-list">
+    <div class="highlight-bar"></div>
+    <div class="industry-track" id="industryTrack">
+      <div class="industry">Retail</div>
+      <div class="industry">Insurance</div>
+      <div class="industry active">Banking</div>
+      <div class="industry">Travel</div>
+      <div class="industry">Real Estate</div>
+    </div>
+  </div>
+
+  <!-- Controls -->
+  <div class="controls">
+    <button class="btn" id="prevBtn" aria-label="Previous">
+      <!-- UP SVG -->
+      <svg width="53" height="54" viewBox="0 0 53 54" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="26.5" cy="27" r="26.5" transform="rotate(-90 26.5 27)" fill="#245AE2"/>
+        <rect x="19" y="31.5" width="2" height="16" transform="rotate(-90 19 31.5)" fill="white"/>
+        <rect x="23" y="27.5" width="2" height="8" transform="rotate(-90 23 27.5)" fill="white"/>
+        <rect x="25" y="23.5" width="2" height="4" transform="rotate(-90 25 23.5)" fill="white"/>
+      </svg>
+    </button>
+
+    <button class="call-btn" id="callBtn" aria-label="Call" aria-pressed="false">
+      <div class="spinner" aria-hidden="true"></div>
+      <svg class="phone-svg" width="96" height="96" viewBox="0 0 96 96" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Call">
+        <!-- fill circle controlled by CSS: green (idle) / red (active) -->
+        <circle class="call-fill" cx="48" cy="48" r="48"/>
+        <circle cx="48" cy="48" r="40" fill="none" stroke="black" stroke-width="2"/>
+        <g transform="translate(42,42)">
+          <rect x="8.82812" y="11.6569" width="12" height="2" transform="rotate(-135 8.82812 11.6569)" fill="black"/>
+          <rect x="3.87793" y="3.87872" width="3" height="2" transform="rotate(-135 3.87793 3.87872)" fill="black"/>
+          <rect x="10.2422" y="10.2427" width="3" height="2" transform="rotate(-135 10.2422 10.2427)" fill="black"/>
+        </g>
+      </svg>
+    </button>
+
+    <button class="btn" id="nextBtn" aria-label="Next">
+      <svg width="53" height="54" viewBox="0 0 53 54" fill="none" xmlns="http://www.w3.org/2000/svg" style="transform: rotate(180deg);">
+        <circle cx="26.5" cy="27" r="26.5" transform="rotate(-90 26.5 27)" fill="#245AE2"/>
+        <rect x="19" y="31.5" width="2" height="16" transform="rotate(-90 19 31.5)" fill="white"/>
+        <rect x="23" y="27.5" width="2" height="8" transform="rotate(-90 23 27.5)" fill="white"/>
+        <rect x="25" y="23.5" width="2" height="4" transform="rotate(-90 25 23.5)" fill="white"/>
+      </svg>
+    </button>
+  </div>
+
+  <!-- Suggestion text -->
+  <div class="suggestion" id="suggestionBox">
+    <div class="suggestion-label">Try asking:</div>
+    <div class="suggestion-prompt" id="suggestionText">
+      How can I reset my internet banking password?
+    </div>
+  </div>
+</div>

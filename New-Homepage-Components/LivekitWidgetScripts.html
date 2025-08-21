@@ -1,0 +1,152 @@
+<!-- ================== WIDGET LOGIC (unchanged DOM; LiveKit wiring) ================== -->
+<script>
+    document.addEventListener("DOMContentLoaded", () => {
+      const track          = document.getElementById("industryTrack");
+      const prevBtn        = document.getElementById("prevBtn");
+      const nextBtn        = document.getElementById("nextBtn");
+      const callBtn        = document.getElementById("callBtn");
+      const suggestionText = document.getElementById("suggestionText");
+  
+      // Your category data (agentId is used to start the call)
+      const categoriesData = [
+        { name: "Retail",      agentId: "a914fe96-2d33-4d84-920b-f8304d82664e", prompt: "How can I track my recent order?" },
+        { name: "Insurance",   agentId: "a914fe96-2d33-4d84-920b-f8304d82664e", prompt: "I am looking for a plan for my family" },
+        { name: "Banking",     agentId: "a914fe96-2d33-4d84-920b-f8304d82664e", prompt: "Hey, I am looking for a fixed rate mortgage" },
+        { name: "Travel",      agentId: "a914fe96-2d33-4d84-920b-f8304d82664e", prompt: "Hey, I am looking to book a room for two people" },
+        { name: "Real Estate", agentId: "a914fe96-2d33-4d84-920b-f8304d82664e", prompt: "What are the current mortgage rates?" },
+      ];
+      const nameToIndex = new Map(categoriesData.map((c, i) => [c.name, i]));
+  
+      // ===== Scroller mechanics (as you had) =====
+      let items = Array.from(track.children);
+      let gap   = parseInt(getComputedStyle(track).gap) || 8;
+      const calcItemHeight = () => {
+        items = Array.from(track.children);
+        gap   = parseInt(getComputedStyle(track).gap) || 8;
+        return items[0].offsetHeight + gap;
+      };
+      let itemHeight = calcItemHeight();
+  
+      // default center is "Banking" in your markup
+      let selectedCategoryIndex = 2;
+  
+      function centerIndex() { return Math.floor(items.length / 2); }
+      function setActiveInstant(shift = 0) {
+        items.forEach(el => el.classList.remove("active"));
+        const idx = (centerIndex() + shift + items.length) % items.length;
+        items[idx].classList.add("active");
+      }
+      function updateSelectionFromCenter(shift = 0) {
+        const idx = (centerIndex() + shift + items.length) % items.length;
+        const name = items[idx].textContent.trim();
+        if (nameToIndex.has(name)) selectedCategoryIndex = nameToIndex.get(name);
+        updateSuggestion();
+      }
+      function updateSuggestion() {
+        const prompt = categoriesData[selectedCategoryIndex]?.prompt ?? "";
+        suggestionText.textContent = prompt;
+      }
+  
+      let isMoving = false;
+      let pendingAction = null;
+      track.addEventListener("transitionend", (e) => {
+        if (e.propertyName !== "transform" || !pendingAction) return;
+        track.style.transition = "none";
+        if (pendingAction === "up") {
+          track.insertBefore(track.lastElementChild, track.firstElementChild);
+        } else if (pendingAction === "down") {
+          track.appendChild(track.firstElementChild);
+        }
+        track.style.transform = "translateY(0)";
+        track.offsetHeight; // reflow
+        track.style.transition = "transform 0.45s cubic-bezier(0.25, 0.1, 0.25, 1.0)";
+        items = Array.from(track.children);
+        setActiveInstant(0);
+        updateSelectionFromCenter(0);
+        isMoving = false;
+        pendingAction = null;
+      });
+  
+      async function moveUp() {
+        if (isMoving) return;
+        if (window.LiveKitWidget.getState().isCallActive) await window.LiveKitWidget.endAgentCall();
+        isMoving = true;
+        pendingAction = "up";
+        itemHeight = calcItemHeight();
+        setActiveInstant(-1);
+        updateSelectionFromCenter(-1);
+        track.style.transition = "transform 0.45s cubic-bezier(0.25, 0.1, 0.25, 1.0)";
+        track.style.transform = `translateY(${itemHeight}px)`;
+      }
+      async function moveDown() {
+        if (isMoving) return;
+        if (window.LiveKitWidget.getState().isCallActive) await window.LiveKitWidget.endAgentCall();
+        isMoving = true;
+        pendingAction = "down";
+        itemHeight = calcItemHeight();
+        setActiveInstant(1);
+        updateSelectionFromCenter(1);
+        track.style.transition = "transform 0.45s cubic-bezier(0.25, 0.1, 0.25, 1.0)";
+        track.style.transform = `translateY(-${itemHeight}px)`;
+      }
+  
+      // ===== Call button behavior =====
+      async function handleMainButtonClick() {
+        const { agentId } = categoriesData[selectedCategoryIndex] || {};
+        if (!agentId) { alert("No agent configured for this category."); return; }
+  
+        const { isCallActive } = window.LiveKitWidget.getState();
+        if (isCallActive) {
+          await window.LiveKitWidget.endAgentCall();
+        } else {
+          // Optional: pass { ttsConfigId, dynamicVars } 2nd arg if you need parity with your hook
+          await window.LiveKitWidget.startAgentCall(agentId);
+        }
+      }
+  
+      async function handleSetSelected(idx) {
+        if (idx === selectedCategoryIndex) return;
+        if (window.LiveKitWidget.getState().isCallActive) {
+          await window.LiveKitWidget.endAgentCall();
+        }
+        selectedCategoryIndex = idx;
+        updateSuggestion();
+      }
+  
+      // Controls
+      prevBtn.addEventListener("click", moveUp);
+      nextBtn.addEventListener("click", moveDown);
+      callBtn.addEventListener("click", handleMainButtonClick);
+  
+      // Touch swipe
+      let startY = 0;
+      track.addEventListener("touchstart", (e) => { startY = e.touches[0].clientY; }, { passive: true });
+      track.addEventListener("touchend", (e) => {
+        const endY = e.changedTouches[0].clientY;
+        const delta = endY - startY;
+        if (Math.abs(delta) > 30) (delta > 0 ? moveUp() : moveDown());
+      });
+  
+      // Recalc on resize
+      window.addEventListener("resize", () => { itemHeight = calcItemHeight(); });
+  
+      // UI state sync (loading/connected)
+      const updateBtnState = () => {
+        const { isCallLoading, isCallActive } = window.LiveKitWidget.getState();
+        callBtn.classList.toggle("is-loading", isCallLoading);
+        callBtn.classList.toggle("is-active",  isCallActive);
+        callBtn.style.pointerEvents = isCallLoading ? "none" : "auto";
+        callBtn.setAttribute("aria-pressed", String(isCallActive));
+      };
+      window.LiveKitWidget.on('statechange', updateBtnState);
+      window.LiveKitWidget.on('ended', updateBtnState);
+      window.LiveKitWidget.on('connected', updateBtnState);
+      window.LiveKitWidget.on('error', (e) => console.error('LiveKitWidget error:', e));
+  
+      // Init
+      items = Array.from(track.children);
+      setActiveInstant(0);
+      updateSelectionFromCenter(0);
+      updateBtnState();
+    });
+  </script>

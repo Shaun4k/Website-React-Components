@@ -1,0 +1,166 @@
+<script>
+    /** ================== CONFIG ================== **/
+    const SERVER_URL = "https://agentx-prod.nurixlabs.tech"; // from VITE_SERVER_URL
+  
+    /** ================== CALL LOGIC (Retell) ================== **/
+    let isCallActive = false;
+    let isCallLoading = false;
+    let retellWebClient = null;
+  
+    // Minimal UI state hook
+    let onStateChange = null;
+  
+    async function getRetellClientCtor() {
+      if (window.RetellWebClient) return window.RetellWebClient;
+  
+      try {
+        const m = await import("https://cdn.skypack.dev/retell-client-js-sdk");
+        return m.RetellWebClient || m.default || window.RetellWebClient;
+      } catch (e) {
+        console.error("Failed to load Retell SDK dynamically:", e);
+        throw new Error(
+          "Retell SDK not available. Include a UMD script or ensure bundler provides it."
+        );
+      }
+    }
+  
+    async function registerCall(agentId) {
+      const res = await fetch(`${SERVER_URL}/start-call`, {
+        method: "POST",
+        headers: {
+          "agentX-ID": agentId,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({}),
+      });
+  
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`registerCall failed: ${res.status} ${text}`);
+      }
+  
+      return res.json();
+    }
+  
+    async function startAgentCall(agentId, onStarted, onEnded, onErrored) {
+      if (isCallActive || isCallLoading) return;
+  
+      isCallLoading = true;
+      onStateChange && onStateChange();
+  
+      try {
+        const { access_token, call_id, sample_rate } = await registerCall(agentId);
+        if (!call_id) throw new Error("Missing call_id in registerCall response");
+  
+        const RetellCtor = await getRetellClientCtor();
+        retellWebClient = new RetellCtor();
+  
+        retellWebClient.on("call_started", () => {
+          isCallActive = true;
+          isCallLoading = false;
+          onStarted && onStarted();
+          onStateChange && onStateChange();
+        });
+  
+        retellWebClient.on("call_ended", () => {
+          endAgentCall().finally(() => {
+            onEnded && onEnded();
+          });
+        });
+  
+        retellWebClient.on("error", (e) => {
+          console.error("Retell error:", e);
+          endAgentCall().finally(() => {
+            onErrored && onErrored(e);
+          });
+        });
+  
+        await retellWebClient.startCall({
+          accessToken: access_token,
+          sampleRate: sample_rate,
+        });
+      } catch (e) {
+        console.error("Error starting call:", e);
+        await endAgentCall();
+        onErrored && onErrored(e);
+      }
+    }
+  
+    async function endAgentCall() {
+      try {
+        isCallLoading = true;
+        onStateChange && onStateChange();
+  
+        if (retellWebClient) {
+          try {
+            retellWebClient.stopCall();
+          } catch (_) {
+            // ignore stop errors
+          }
+          retellWebClient = null;
+        }
+      } finally {
+        isCallActive = false;
+        isCallLoading = false;
+        onStateChange && onStateChange();
+      }
+    }
+  </script>
+  <!-- ================== HTML ================== -->
+  <div class="industry-widget">
+    <!-- Industry list -->
+    <div class="industry-list">
+      <div class="highlight-bar"></div>
+      <div class="industry-track" id="industryTrack">
+        <div class="industry">Retail</div>
+        <div class="industry">Insurance</div>
+        <div class="industry active">Banking</div>
+        <div class="industry">Travel</div>
+        <div class="industry">Real Estate</div>
+      </div>
+    </div>
+  
+    <!-- Controls -->
+    <div class="controls">
+      <button class="btn" id="prevBtn" aria-label="Previous">
+        <!-- UP SVG -->
+        <svg width="53" height="54" viewBox="0 0 53 54" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="26.5" cy="27" r="26.5" transform="rotate(-90 26.5 27)" fill="#245AE2"/>
+          <rect x="19" y="31.5" width="2" height="16" transform="rotate(-90 19 31.5)" fill="white"/>
+          <rect x="23" y="27.5" width="2" height="8" transform="rotate(-90 23 27.5)" fill="white"/>
+          <rect x="25" y="23.5" width="2" height="4" transform="rotate(-90 25 23.5)" fill="white"/>
+        </svg>
+      </button>
+  
+      <button class="call-btn" id="callBtn" aria-label="Call" aria-pressed="false">
+        <div class="spinner" aria-hidden="true"></div>
+        <svg class="phone-svg" width="96" height="96" viewBox="0 0 96 96" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Call">
+          <!-- fill circle controlled by CSS: green (idle) / red (active) -->
+          <circle class="call-fill" cx="48" cy="48" r="48"/>
+          <circle cx="48" cy="48" r="40" fill="none" stroke="black" stroke-width="2"/>
+          <g transform="translate(42,42)">
+            <rect x="8.82812" y="11.6569" width="12" height="2" transform="rotate(-135 8.82812 11.6569)" fill="black"/>
+            <rect x="3.87793" y="3.87872" width="3" height="2" transform="rotate(-135 3.87793 3.87872)" fill="black"/>
+            <rect x="10.2422" y="10.2427" width="3" height="2" transform="rotate(-135 10.2422 10.2427)" fill="black"/>
+          </g>
+        </svg>
+      </button>
+  
+      <button class="btn" id="nextBtn" aria-label="Next">
+        <svg width="53" height="54" viewBox="0 0 53 54" fill="none" xmlns="http://www.w3.org/2000/svg" style="transform: rotate(180deg);">
+          <circle cx="26.5" cy="27" r="26.5" transform="rotate(-90 26.5 27)" fill="#245AE2"/>
+          <rect x="19" y="31.5" width="2" height="16" transform="rotate(-90 19 31.5)" fill="white"/>
+          <rect x="23" y="27.5" width="2" height="8" transform="rotate(-90 23 27.5)" fill="white"/>
+          <rect x="25" y="23.5" width="2" height="4" transform="rotate(-90 25 23.5)" fill="white"/>
+        </svg>
+      </button>
+    </div>
+  
+    <!-- Suggestion text -->
+    <div class="suggestion" id="suggestionBox">
+      <div class="suggestion-label">Try asking:</div>
+      <div class="suggestion-prompt" id="suggestionText">
+        How can I reset my internet banking password?
+      </div>
+    </div>
+  </div>

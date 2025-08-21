@@ -1,0 +1,216 @@
+<script>
+    /** ================== WIDGET LOGIC ================== **/
+    document.addEventListener("DOMContentLoaded", () => {
+      const track = document.getElementById("industryTrack");
+      const prevBtn = document.getElementById("prevBtn");
+      const nextBtn = document.getElementById("nextBtn");
+      const callBtn = document.getElementById("callBtn");
+      const suggestionText = document.getElementById("suggestionText");
+  
+      // Data with agentId + prompt
+      const categoriesData = [
+        {
+          name: "Retail",
+          agentId: "c6479ac8-feac-4b19-943f-c1f4099e5988",
+          prompt: "How can I track my recent order?",
+        },
+        {
+          name: "Insurance",
+          agentId: "205cd6f2-79ad-4a2b-b3dd-d927b6359055",
+          prompt: "I am looking for a plan for my family",
+        },
+        {
+          name: "Banking",
+          agentId: "5dd78249-ffb2-4878-9bd9-451ce1bb8145",
+          prompt: "Hey, I am looking for a fixed rate mortgage",
+        },
+        {
+          name: "Travel",
+          agentId: "2cf83ca7-4204-47cb-940d-70e5237aa46f",
+          prompt: "Hey, I am looking to book a room for two people",
+        },
+        {
+          name: "Real Estate",
+          agentId: "fa441586-b41e-4756-abd5-f4435a8f126d",
+          prompt: "What are the current mortgage rates?",
+        },
+      ];
+  
+      const nameToIndex = new Map(categoriesData.map((c, i) => [c.name, i]));
+  
+      // State derived from DOM
+      let items = Array.from(track.children);
+      let gap = parseInt(getComputedStyle(track).gap) || 8;
+  
+      const calcItemHeight = () => {
+        items = Array.from(track.children);
+        gap = parseInt(getComputedStyle(track).gap) || 8;
+        return items[0].offsetHeight + gap;
+      };
+  
+      let itemHeight = calcItemHeight();
+  
+      // Default center = Banking (index 2 in your markup)
+      let selectedCategoryIndex = 2;
+  
+      function centerIndex() {
+        return Math.floor(items.length / 2);
+      }
+  
+      function setActiveInstant(shift = 0) {
+        items.forEach((el) => el.classList.remove("active"));
+        const idx = (centerIndex() + shift + items.length) % items.length;
+        items[idx].classList.add("active");
+      }
+  
+      function updateSelectionFromCenter(shift = 0) {
+        const idx = (centerIndex() + shift + items.length) % items.length;
+        const name = items[idx].textContent.trim();
+        if (nameToIndex.has(name)) {
+          selectedCategoryIndex = nameToIndex.get(name);
+        }
+        updateSuggestion();
+      }
+  
+      function updateSuggestion() {
+        const prompt = categoriesData[selectedCategoryIndex]?.prompt ?? "";
+        suggestionText.textContent = prompt;
+      }
+  
+      // Movement
+      let isMoving = false;
+      let pendingAction = null;
+  
+      track.addEventListener("transitionend", (e) => {
+        if (e.propertyName !== "transform" || !pendingAction) return;
+  
+        track.style.transition = "none";
+  
+        if (pendingAction === "up") {
+          track.insertBefore(track.lastElementChild, track.firstElementChild);
+        } else if (pendingAction === "down") {
+          track.appendChild(track.firstElementChild);
+        }
+  
+        track.style.transform = "translateY(0)";
+        track.offsetHeight; // reflow
+  
+        track.style.transition =
+          "transform 0.45s cubic-bezier(0.25, 0.1, 0.25, 1.0)";
+  
+        items = Array.from(track.children);
+        setActiveInstant(0);
+        updateSelectionFromCenter(0);
+  
+        isMoving = false;
+        pendingAction = null;
+      });
+  
+      /* ===== CHANGED: end call when changing categories ===== */
+      async function moveUp() {
+        if (isMoving) return;
+        if (isCallActive) await endAgentCall(); // end active call on category change
+  
+        isMoving = true;
+        pendingAction = "up";
+        itemHeight = calcItemHeight();
+  
+        setActiveInstant(-1);
+        updateSelectionFromCenter(-1);
+  
+        track.style.transition =
+          "transform 0.45s cubic-bezier(0.25, 0.1, 0.25, 1.0)";
+        track.style.transform = `translateY(${itemHeight}px)`;
+      }
+  
+      /* ===== CHANGED: end call when changing categories ===== */
+      async function moveDown() {
+        if (isMoving) return;
+        if (isCallActive) await endAgentCall(); // end active call on category change
+  
+        isMoving = true;
+        pendingAction = "down";
+        itemHeight = calcItemHeight();
+  
+        setActiveInstant(1);
+        updateSelectionFromCenter(1);
+  
+        track.style.transition =
+          "transform 0.45s cubic-bezier(0.25, 0.1, 0.25, 1.0)";
+        track.style.transform = `translateY(-${itemHeight}px)`;
+      }
+  
+      // Call button behavior
+      async function handleMainButtonClick() {
+        const { agentId } = categoriesData[selectedCategoryIndex] || {};
+        if (!agentId) {
+          alert("No agent configured for this category.");
+          return;
+        }
+  
+        if (isCallActive) {
+          await endAgentCall();
+        } else {
+          await startAgentCall(agentId, () => {}, () => {}, (e) =>
+            console.error(e)
+          );
+        }
+      }
+  
+      // End call if switching while connected
+      async function handleSetSelected(idx) {
+        if (idx === selectedCategoryIndex) return;
+        if (isCallActive) {
+          await endAgentCall();
+        }
+        selectedCategoryIndex = idx;
+        updateSuggestion();
+      }
+  
+      // Controls
+      prevBtn.addEventListener("click", () => {
+        moveUp();
+      });
+      nextBtn.addEventListener("click", () => {
+        moveDown();
+      });
+      callBtn.addEventListener("click", handleMainButtonClick);
+  
+      // Touch swipe
+      let startY = 0;
+      track.addEventListener(
+        "touchstart",
+        (e) => {
+          startY = e.touches[0].clientY;
+        },
+        { passive: true }
+      );
+  
+      track.addEventListener("touchend", (e) => {
+        const endY = e.changedTouches[0].clientY;
+        const delta = endY - startY;
+        if (Math.abs(delta) > 30) {
+          delta > 0 ? moveUp() : moveDown();
+        }
+      });
+  
+      // Recalc on resize
+      window.addEventListener("resize", () => {
+        itemHeight = calcItemHeight();
+      });
+  
+      // UI state sync (loading/connected)
+      onStateChange = function () {
+        callBtn.classList.toggle("is-loading", isCallLoading);
+        callBtn.classList.toggle("is-active", isCallActive);
+        callBtn.style.pointerEvents = isCallLoading ? "none" : "auto";
+        callBtn.setAttribute("aria-pressed", String(isCallActive));
+      };
+  
+      // Init
+      items = Array.from(track.children);
+      setActiveInstant(0);
+      updateSelectionFromCenter(0);
+      onStateChange();
+    });
+  </script>
